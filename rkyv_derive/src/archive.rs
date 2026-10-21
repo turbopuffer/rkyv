@@ -813,11 +813,15 @@ fn derive_archive_impl(
                 .variants
                 .iter()
                 .all(|v| matches!(v.fields, Fields::Unit));
+            let has_explicit_discriminants = data.variants.iter().any(|v| v.discriminant.is_some());
             #[cfg(all(
                 not(feature = "arbitrary_enum_discriminant"),
                 any(feature = "archive_le", feature = "archive_be")
             ))]
-            if !is_fieldless && !matches!(int_repr, IntRepr::U8 | IntRepr::I8) {
+            if !has_explicit_discriminants
+                && !is_fieldless
+                && !matches!(int_repr, IntRepr::U8 | IntRepr::I8)
+            {
                 return Err(Error::new_spanned(
                     name,
                     "\
@@ -827,15 +831,55 @@ fn derive_archive_impl(
                 ));
             }
 
+            // Explicit discriminants are honored so the archived tags match the source enum.
+            // Every variant gets an explicit value since byte swapping breaks implicit numbering.
+            let explicit_discriminants = has_explicit_discriminants.then(|| {
+                let mut base = quote! { 0 };
+                let mut offset = 0usize;
+                data.variants
+                    .iter()
+                    .map(|v| {
+                        if let Some((_, expr)) = &v.discriminant {
+                            base = quote! { (#expr) };
+                            offset = 0;
+                        }
+                        let offset_lit = proc_macro2::Literal::usize_unsuffixed(offset);
+                        offset += 1;
+                        let value = quote! { (#base as #int_repr + #offset_lit) };
+                        // Swap on targets whose native order differs from the archived order.
+                        #[cfg(feature = "archive_be")]
+                        let value = quote! {
+                            if cfg!(target_endian = "little") { #value.swap_bytes() } else { #value }
+                        };
+                        #[cfg(feature = "archive_le")]
+                        let value = quote! {
+                            if cfg!(target_endian = "big") { #value.swap_bytes() } else { #value }
+                        };
+                        quote! { = #value }
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let variant_discriminant = |i: usize| -> TokenStream {
+                match &explicit_discriminants {
+                    Some(discriminants) => discriminants[i].clone(),
+                    None => {
+                        let discriminant = int_repr.enum_discriminant(i);
+                        quote! { #discriminant }
+                    }
+                }
+            };
+
             let archived_def = if attributes.archive_as.is_none() {
                 let archived_variants = data.variants.iter().enumerate().map(|(i, v)| {
                     let variant = &v.ident;
-                    let discriminant =
-                        if is_fieldless || cfg!(feature = "arbitrary_enum_discriminant") {
-                            Some(int_repr.enum_discriminant(i))
-                        } else {
-                            None
-                        };
+                    let discriminant = if has_explicit_discriminants
+                        || is_fieldless
+                        || cfg!(feature = "arbitrary_enum_discriminant")
+                    {
+                        Some(variant_discriminant(i))
+                    } else {
+                        None
+                    };
                     match v.fields {
                         Fields::Named(ref fields) => {
                             let fields = fields.named.iter().map(|f| {
@@ -915,7 +959,7 @@ fn derive_archive_impl(
 
             let archived_variant_tags = data.variants.iter().enumerate().map(|(i, v)| {
                 let variant = &v.ident;
-                let discriminant = int_repr.enum_discriminant(i);
+                let discriminant = variant_discriminant(i);
                 quote! { #variant #discriminant }
             });
 
